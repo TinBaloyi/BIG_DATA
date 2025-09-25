@@ -1,0 +1,15 @@
+(
+echo data/
+echo checkpoints/
+echo experiments/
+echo *.nii
+echo *.nii.gz
+echo *.gz
+echo *.zip
+echo __pycache__/
+echo .ipynb_checkpoints/
+echo .venv/
+echo .env/
+echo .vscode/
+echo .idea/
+) > .gitignore
