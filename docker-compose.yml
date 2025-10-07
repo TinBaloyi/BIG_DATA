@@ -1,0 +1,28 @@
+version: '3.8'
+services:
+  brats:
+    build: .
+    image: big_data_brats:latest
+    runtime: nvidia                 # legacy key; modern docker uses --gpus
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    environment:
+      - TZ=UTC
+      - NCCL_DEBUG=INFO
+    # Mount host dataset and runs dir (update host paths)
+    volumes:
+      - ./data/raw:/workspace/data/raw:ro         # read-only dataset
+      - ./runs:/workspace/runs                    # checkpoints, preds
+      - ./:/workspace                             # code (bind mount for dev)
+    working_dir: /workspace
+    command: ["bash"]
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 8G
+    # For docker-compose v2 with GPU
+    # if using docker CLI directly, run: docker run --gpus all ...
