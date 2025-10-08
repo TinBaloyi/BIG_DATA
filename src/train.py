@@ -1,14 +1,4 @@
 # src/train.py
-"""
-Training entrypoint.
-Supports:
- - persistent cache via PersistentDataset (cache_dir on Drive)
- - resume auto from out_dir/checkpoints/last.ckpt
- - mixed precision (AMP)
- - grad accumulation (accum_steps)
- - sliding-window validation
-"""
-
 import os, argparse, time
 import torch
 from torch.utils.data import DataLoader
@@ -17,6 +7,7 @@ from monai.losses import DiceCELoss
 from monai.inferers import sliding_window_inference
 from monai.metrics import DiceMetric
 import monai.transforms as mt
+from tqdm import tqdm  # ✅ Added progress bar
 
 from dataset import build_file_list_from_roots, get_transforms, make_datasets
 from model import build_unet3d
@@ -48,27 +39,42 @@ def parse_args():
 def main():
     args = parse_args()
     set_seed(args.seed)
+
+    # ✅ Automatically create an output directory on Drive if not set
+    if "drive" not in args.out_dir:
+        drive_path = "/content/drive/MyDrive/Colab Notebooks/Projects/BIG_DATA/checkpoints"
+        os.makedirs(drive_path, exist_ok=True)
+        args.out_dir = drive_path
+        print(f"[INFO] Saving checkpoints to {drive_path}")
+
     os.makedirs(args.out_dir, exist_ok=True)
 
+    # ✅ Build datasets
     train_items, val_items = build_file_list_from_roots(args.data_roots, split_ratio=0.9, seed=args.seed)
     preproc, train_rand, val_t = get_transforms(tuple(args.pixdim), tuple(args.roi))
-    train_ds, val_ds, collate_fn = make_datasets(train_items, val_items, preproc, train_rand,
-                                                 use_persistent_cache=bool(args.use_persistent_cache),
-                                                 cache_dir=args.cache_dir, cache_rate=args.cache_rate, num_workers=args.workers)
+    train_ds, val_ds, collate_fn = make_datasets(
+        train_items, val_items, preproc, train_rand,
+        use_persistent_cache=bool(args.use_persistent_cache),
+        cache_dir=args.cache_dir, cache_rate=args.cache_rate, num_workers=args.workers
+    )
 
     train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True, num_workers=args.workers,
                               pin_memory=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=args.workers, pin_memory=True)
 
+    # ✅ GPU detection
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] Using device: {device}")
+    if torch.cuda.is_available():
+        print(f"[INFO] GPU: {torch.cuda.get_device_name(0)}")
+
     model = build_unet3d(in_channels=4, num_classes=5).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scaler = GradScaler(enabled=args.amp)
 
-    # resume logic
-    start_epoch = 1
-    best_metric = 0.0
+    # ✅ Resume logic
+    start_epoch, best_metric = 1, 0.0
     if args.resume == "auto":
         ck = find_latest_checkpoint(args.out_dir)
         if ck:
@@ -76,69 +82,73 @@ def main():
             if st:
                 start_epoch = int(st.get("epoch", 0)) + 1
                 best_metric = float(st.get("best_metric", 0.0) or 0.0)
-                print(f"Resumed from {ck}, starting epoch {start_epoch}, best_metric={best_metric:.4f}")
+                print(f"[INFO] Resumed from {ck}, epoch {start_epoch}, best dice={best_metric:.4f}")
     elif args.resume == "path" and args.resume_path:
         st = load_checkpoint(args.resume_path, model, optimizer, scaler)
         start_epoch = int(st.get("epoch", 0)) + 1
 
-    loss_fn = DiceCELoss(include_background=False, to_onehot_y=True, softmax=True, lambda_dice=1.0, lambda_ce=1.0)
+    loss_fn = DiceCELoss(include_background=False, to_onehot_y=True, softmax=True,
+                         lambda_dice=1.0, lambda_ce=1.0)
     dice_metric = DiceMetric(include_background=False, reduction="mean_batch")
 
-    for epoch in range(start_epoch, args.epochs+1):
+    # ✅ Training loop with tqdm progress bar
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         epoch_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
-        step = 0
-        for batch in train_loader:
+
+        loop = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}", leave=False)
+        for step, batch in enumerate(loop):
             imgs = batch["image"].to(device)
-            labels = batch["label"].to(device)  # shape (B,1,D,H,W)
+            labels = batch["label"].to(device)
             with autocast(enabled=args.amp):
-                logits = model(imgs)  # (B,5,D,H,W)
-                loss = loss_fn(logits, labels)
-                loss = loss / args.accum_steps
+                logits = model(imgs)
+                loss = loss_fn(logits, labels) / args.accum_steps
             scaler.scale(loss).backward()
-            step += 1
-            if step % args.accum_steps == 0:
-                scaler.step(optimizer); scaler.update()
+
+            if (step + 1) % args.accum_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+
             epoch_loss += float(loss.item() * args.accum_steps)
+            loop.set_postfix(loss=float(loss.item()))
 
         avg_loss = epoch_loss / max(1, len(train_loader))
-        print(f"Epoch {epoch}/{args.epochs} - train loss: {avg_loss:.4f}")
+        print(f"Epoch {epoch}/{args.epochs} - Train loss: {avg_loss:.4f}")
 
-        # validation: sliding window inference
+        # ✅ Validation
         model.eval()
         dice_vals = []
         with torch.no_grad():
-            for batch in val_loader:
+            for batch in tqdm(val_loader, desc="Validating", leave=False):
                 imgs = batch["image"].to(device)
                 labels = batch["label"].to(device)
-                logits = sliding_window_inference(imgs, roi_size=tuple(args.roi), sw_batch_size=1, predictor=model, overlap=0.5)
-                # argmax for voxel-wise
+                logits = sliding_window_inference(imgs, roi_size=tuple(args.roi),
+                                                  sw_batch_size=1, predictor=model, overlap=0.5)
                 probs = torch.softmax(logits, dim=1)
-                pred_lbl = torch.argmax(probs, dim=1, keepdim=True)  # (B,1,D,H,W)
-                # compute one-hot for classes 1..4
-                onehot_pred = torch.nn.functional.one_hot(pred_lbl.squeeze(1).long(), num_classes=5).permute(0,4,1,2,3).float()
-                onehot_gt = torch.nn.functional.one_hot(labels.squeeze(1).long(), num_classes=5).permute(0,4,1,2,3).float()
-                # exclude background
+                pred_lbl = torch.argmax(probs, dim=1, keepdim=True)
+                onehot_pred = torch.nn.functional.one_hot(pred_lbl.squeeze(1).long(),
+                                                          num_classes=5).permute(0,4,1,2,3).float()
+                onehot_gt = torch.nn.functional.one_hot(labels.squeeze(1).long(),
+                                                        num_classes=5).permute(0,4,1,2,3).float()
                 dice_metric(y_pred=onehot_pred[:,1:], y=onehot_gt[:,1:])
-                dv = dice_metric.aggregate().item()
-                dice_vals.append(dv)
+                dice_vals.append(dice_metric.aggregate().item())
                 dice_metric.reset()
 
         mean_dice = float(sum(dice_vals) / max(1, len(dice_vals)))
-        print(f"Epoch {epoch} - val voxel-wise mean dice (classes 1..4): {mean_dice:.4f}")
+        print(f"Epoch {epoch} - Val mean Dice: {mean_dice:.4f}")
 
-        # checkpointing
+        # ✅ Checkpointing to Drive
         if epoch % args.save_every == 0:
             save_checkpoint(args.out_dir, epoch, model, optimizer, scaler, best_metric, tag="last")
         if args.keep_best and mean_dice > best_metric:
             best_metric = mean_dice
             save_checkpoint(args.out_dir, epoch, model, optimizer, scaler, best_metric, tag="best")
-            print(f"  ✓ new best {best_metric:.4f} saved.")
+            print(f"  ✓ New best model saved ({best_metric:.4f})")
 
-    # final save
     save_checkpoint(args.out_dir, args.epochs, model, optimizer, scaler, best_metric, tag="last")
-    print("Training complete.")
+    print("✅ Training complete.")
+
 if __name__ == "__main__":
     main()
