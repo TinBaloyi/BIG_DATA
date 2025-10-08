@@ -1,4 +1,6 @@
 # src/train.py
+import matplotlib
+matplotlib.use('Agg')
 import os, argparse, time
 import torch
 from torch.utils.data import DataLoader
