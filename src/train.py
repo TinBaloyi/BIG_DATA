@@ -1,10 +1,14 @@
-# src/train.py
+# ======================================
+# train.py (Colab-safe MONAI training)
+# ======================================
+
 import os
-os.environ["MPLBACKEND"] = "Agg"  # ✅ fix matplotlib backend before MONAI imports
+# ✅ Fix for matplotlib backend issue in Colab
+os.environ["MPLBACKEND"] = "Agg"
 import matplotlib
 matplotlib.use("Agg")
 
-import os, argparse, time
+import argparse, time
 import torch
 from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
@@ -12,12 +16,13 @@ from monai.losses import DiceCELoss
 from monai.inferers import sliding_window_inference
 from monai.metrics import DiceMetric
 import monai.transforms as mt
-from tqdm import tqdm  # ✅ Added progress bar
+from monai.data import decollate_batch
+import matplotlib.pyplot as plt
 
 from dataset import build_file_list_from_roots, get_transforms, make_datasets
 from model import build_unet3d
 from utils import save_checkpoint, find_latest_checkpoint, load_checkpoint, set_seed
-from monai.data import decollate_batch
+
 
 def parse_args():
     ap = argparse.ArgumentParser()
@@ -31,9 +36,9 @@ def parse_args():
     ap.add_argument("--cache_rate", type=float, default=0.3)
     ap.add_argument("--use_persistent_cache", type=int, default=0)
     ap.add_argument("--cache_dir", type=str, default=None)
-    ap.add_argument("--roi", type=int, nargs=3, default=[128,128,128])
-    ap.add_argument("--pixdim", type=float, nargs=3, default=[1.0,1.0,1.0])
-    ap.add_argument("--resume", choices=["auto","none","path"], default="auto")
+    ap.add_argument("--roi", type=int, nargs=3, default=[128, 128, 128])
+    ap.add_argument("--pixdim", type=float, nargs=3, default=[1.0, 1.0, 1.0])
+    ap.add_argument("--resume", choices=["auto", "none", "path"], default="auto")
     ap.add_argument("--resume_path", type=str, default="")
     ap.add_argument("--save_every", type=int, default=1)
     ap.add_argument("--keep_best", action="store_true")
@@ -41,20 +46,12 @@ def parse_args():
     ap.add_argument("--seed", type=int, default=42)
     return ap.parse_args()
 
+
 def main():
     args = parse_args()
     set_seed(args.seed)
-
-    # ✅ Automatically create an output directory on Drive if not set
-    if "drive" not in args.out_dir:
-        drive_path = "/content/drive/MyDrive/Colab Notebooks/Projects/BIG_DATA/checkpoints"
-        os.makedirs(drive_path, exist_ok=True)
-        args.out_dir = drive_path
-        print(f"[INFO] Saving checkpoints to {drive_path}")
-
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # ✅ Build datasets
     train_items, val_items = build_file_list_from_roots(args.data_roots, split_ratio=0.9, seed=args.seed)
     preproc, train_rand, val_t = get_transforms(tuple(args.pixdim), tuple(args.roi))
     train_ds, val_ds, collate_fn = make_datasets(
@@ -63,23 +60,21 @@ def main():
         cache_dir=args.cache_dir, cache_rate=args.cache_rate, num_workers=args.workers
     )
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True, num_workers=args.workers,
-                              pin_memory=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=args.workers, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True,
+                              num_workers=args.workers, pin_memory=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False,
+                            num_workers=args.workers, pin_memory=True)
 
-    # ✅ GPU detection
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[INFO] Using device: {device}")
-    if torch.cuda.is_available():
-        print(f"[INFO] GPU: {torch.cuda.get_device_name(0)}")
-
+    print(f"Using device: {device}")
     model = build_unet3d(in_channels=4, num_classes=5).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scaler = GradScaler(enabled=args.amp)
 
-    # ✅ Resume logic
-    start_epoch, best_metric = 1, 0.0
+    # Resume checkpoint
+    start_epoch = 1
+    best_metric = 0.0
     if args.resume == "auto":
         ck = find_latest_checkpoint(args.out_dir)
         if ck:
@@ -87,7 +82,7 @@ def main():
             if st:
                 start_epoch = int(st.get("epoch", 0)) + 1
                 best_metric = float(st.get("best_metric", 0.0) or 0.0)
-                print(f"[INFO] Resumed from {ck}, epoch {start_epoch}, best dice={best_metric:.4f}")
+                print(f"Resumed from {ck}, starting epoch {start_epoch}, best_metric={best_metric:.4f}")
     elif args.resume == "path" and args.resume_path:
         st = load_checkpoint(args.resume_path, model, optimizer, scaler)
         start_epoch = int(st.get("epoch", 0)) + 1
@@ -96,37 +91,39 @@ def main():
                          lambda_dice=1.0, lambda_ce=1.0)
     dice_metric = DiceMetric(include_background=False, reduction="mean_batch")
 
-    # ✅ Training loop with tqdm progress bar
+    # Lists to record training progress
+    train_losses, val_dices = [], []
+
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         epoch_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
+        step = 0
 
-        loop = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}", leave=False)
-        for step, batch in enumerate(loop):
+        for batch in train_loader:
             imgs = batch["image"].to(device)
             labels = batch["label"].to(device)
             with autocast(enabled=args.amp):
                 logits = model(imgs)
-                loss = loss_fn(logits, labels) / args.accum_steps
+                loss = loss_fn(logits, labels)
+                loss = loss / args.accum_steps
             scaler.scale(loss).backward()
-
-            if (step + 1) % args.accum_steps == 0:
+            step += 1
+            if step % args.accum_steps == 0:
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
-
             epoch_loss += float(loss.item() * args.accum_steps)
-            loop.set_postfix(loss=float(loss.item()))
 
         avg_loss = epoch_loss / max(1, len(train_loader))
-        print(f"Epoch {epoch}/{args.epochs} - Train loss: {avg_loss:.4f}")
+        train_losses.append(avg_loss)
+        print(f"Epoch {epoch}/{args.epochs} - train loss: {avg_loss:.4f}")
 
-        # ✅ Validation
+        # Validation
         model.eval()
         dice_vals = []
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Validating", leave=False):
+            for batch in val_loader:
                 imgs = batch["image"].to(device)
                 labels = batch["label"].to(device)
                 logits = sliding_window_inference(imgs, roi_size=tuple(args.roi),
@@ -134,26 +131,43 @@ def main():
                 probs = torch.softmax(logits, dim=1)
                 pred_lbl = torch.argmax(probs, dim=1, keepdim=True)
                 onehot_pred = torch.nn.functional.one_hot(pred_lbl.squeeze(1).long(),
-                                                          num_classes=5).permute(0,4,1,2,3).float()
+                                                          num_classes=5).permute(0, 4, 1, 2, 3).float()
                 onehot_gt = torch.nn.functional.one_hot(labels.squeeze(1).long(),
-                                                        num_classes=5).permute(0,4,1,2,3).float()
-                dice_metric(y_pred=onehot_pred[:,1:], y=onehot_gt[:,1:])
-                dice_vals.append(dice_metric.aggregate().item())
+                                                        num_classes=5).permute(0, 4, 1, 2, 3).float()
+                dice_metric(y_pred=onehot_pred[:, 1:], y=onehot_gt[:, 1:])
+                dv = dice_metric.aggregate().item()
+                dice_vals.append(dv)
                 dice_metric.reset()
 
         mean_dice = float(sum(dice_vals) / max(1, len(dice_vals)))
-        print(f"Epoch {epoch} - Val mean Dice: {mean_dice:.4f}")
+        val_dices.append(mean_dice)
+        print(f"Epoch {epoch} - val voxel-wise mean dice (classes 1..4): {mean_dice:.4f}")
 
-        # ✅ Checkpointing to Drive
+        # Checkpointing
         if epoch % args.save_every == 0:
             save_checkpoint(args.out_dir, epoch, model, optimizer, scaler, best_metric, tag="last")
         if args.keep_best and mean_dice > best_metric:
             best_metric = mean_dice
             save_checkpoint(args.out_dir, epoch, model, optimizer, scaler, best_metric, tag="best")
-            print(f"  ✓ New best model saved ({best_metric:.4f})")
+            print(f"  ✓ new best {best_metric:.4f} saved.")
 
+    # Final checkpoint
     save_checkpoint(args.out_dir, args.epochs, model, optimizer, scaler, best_metric, tag="last")
-    print("✅ Training complete.")
+
+    # Plot training and validation curves
+    plt.figure(figsize=(8, 5))
+    plt.plot(train_losses, label="Training Loss", color="blue")
+    plt.plot(val_dices, label="Validation Dice", color="green")
+    plt.title("Training Progress")
+    plt.xlabel("Epochs")
+    plt.ylabel("Value")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plot_path = os.path.join(args.out_dir, "training_curves.png")
+    plt.savefig(plot_path)
+    print(f"✅ Training complete. Curves saved to {plot_path}")
+
 
 if __name__ == "__main__":
     main()
