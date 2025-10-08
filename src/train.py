@@ -1,6 +1,9 @@
 # src/train.py
+import os
+os.environ["MPLBACKEND"] = "Agg"  # ✅ fix matplotlib backend before MONAI imports
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use("Agg")
+
 import os, argparse, time
 import torch
 from torch.utils.data import DataLoader
