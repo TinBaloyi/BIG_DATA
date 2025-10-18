@@ -207,8 +207,8 @@ class BraTSPreprocessor:
             # Save metadata
             metadata = {
                 'patient_id': patient_id,
-                'original_shape': list(volume.shape),
-                'bbox': bbox,
+                'original_shape': [int(x) for x in volume.shape],
+                'bbox': [int(x) for x in bbox] if bbox is not None else None,
                 'modalities': list(self.modalities.values()),
                 'has_segmentation': data['segmentation'] is not None
             }
@@ -275,8 +275,8 @@ class BraTSPreprocessor:
 
 if __name__ == '__main__':
     # Configuration
-    RAW_DATA_DIR = '/path/to/brats/raw/data'  # Update this
-    PROCESSED_DATA_DIR = '/path/to/brats/processed/data'  # Update this
+    RAW_DATA_DIR = r'C:\Projects\BIG_DATA\BIG_DATA\data\raw\training_data1_v2'
+    PROCESSED_DATA_DIR = r'C:\Projects\BIG_DATA\BIG_DATA\data\processed'  # Update this
     
     # Initialize preprocessor
     preprocessor = BraTSPreprocessor(RAW_DATA_DIR, PROCESSED_DATA_DIR)
